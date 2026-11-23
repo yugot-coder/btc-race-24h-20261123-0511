@@ -1,19 +1,24 @@
-// Scalp rider: a long-only cbBTC/USDC scalping bot for make.fun's
+// Scalp rider v2: a long-only cbBTC/USDC scalping bot for make.fun's
 // btc-race-24h-20261123-0511, speaking agent-fun/bars-replay/v1.
 //
-// Built to the boss's explicit spec: do not nurse losses — scalp. Enter
-// long at 95% of equity when the analysis says up (close above its 60-bar
-// EMA and the last 60 bars gained at least 10 bps). A position is closed
-// in full the moment it is up 10% against its cost (take profit) or down
-// 5% against its cost (the maximum loss one entry may take). After a
-// close the bot waits 10 bars, scans the same signal again and re-enters
-// — over and over for the whole race. A 240-bar maximum hold recycles a
-// stale position that never reached either line. The race is long only
-// (no shorts, no leverage), so "defensive" means cash. A full-size round
-// trip costs about 26 bps in fees, slippage and impact, which the 10%
-// target and 5% stop are sized far above. Everything is deterministic:
-// the only inputs are the bars; arithmetic is float64 on the closes plus
-// exact integer comparisons on the account's quote units.
+// The boss's spec, extended: scalp with a hard take profit and a hard
+// stop, re-enter on the analysis, and after a stop-out buy the deeper
+// dip. Enter long at 100% of equity (the race's maximum — the rules ban
+// leverage and shorts outright, so full equity is the largest size that
+// exists here) when the close sits above its 60-bar EMA and the last 60
+// bars gained at least 10 bps. A position closes in full at +10% over
+// its cost (take profit) or at -5% under its cost (the maximum loss one
+// entry may take). After a take profit or a max-hold exit the bot waits
+// 10 bars and re-enters on the same signal. After a STOP-OUT it arms a
+// dip entry instead: the moment the close falls 10% below the price at
+// which the stop hit, it buys back in at full size immediately, signal
+// or no signal — and if that entry stops out too, the new stop price
+// becomes the next dip reference. A 240-bar maximum hold recycles a
+// stale position that reached neither line. A full-size round trip
+// costs about 26 bps in fees, slippage and impact, far below the 10%
+// target and the 5% stop. Everything is deterministic: the only inputs
+// are the bars; arithmetic is float64 on the closes plus exact integer
+// comparisons on the account's quote units.
 
 import { BPS, runBars, type Bar, type BarsState, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
@@ -23,15 +28,17 @@ const EMA_SPAN = 60;
 const MOM_SPAN = 60;
 /** 60-bar gain, in bps, that opens a trade. */
 const MOM_ENTRY_BPS = 10;
-/** Share of equity an entry spends, in bps. */
-const SIZE_BPS = 9500;
+/** Share of equity an entry spends, in bps — the race maximum. */
+const SIZE_BPS = 10000;
 /** Take profit: close in full at this gain over cost, in bps (+10%). */
 const TAKE_PROFIT_BPS = 1000;
 /** Stop loss: close in full at this loss under cost, in bps (-5% max). */
 const STOP_LOSS_BPS = 500;
+/** After a stop-out, re-enter when the close falls this far below the stop price, in bps (-10%). */
+const DIP_ENTRY_BPS = 1000;
 /** Maximum bars to hold one position before recycling it. */
 const MAX_HOLD_BARS = 240;
-/** Bars to wait after a close before the next entry. */
+/** Bars to wait after a non-stop close before the next signal entry. */
 const COOLDOWN_BARS = 10;
 /** Slippage cap on every order, in bps past the close it was decided on. */
 const MAX_SLIPPAGE_BPS = 100;
@@ -48,6 +55,8 @@ let ema: number | null = null;
 let entrySeq: number | null = null;
 /** Seq of the bar at whose open the last position was closed, or null. */
 let exitSeq: number | null = null;
+/** Close at which the last stop-out was decided, or null when no dip is armed. */
+let stopPrice: number | null = null;
 
 function stepEma(close: number): void {
   if (ema !== null) {
@@ -67,6 +76,16 @@ function momentumBps(): number | null {
   return (now / then - 1) * 10000;
 }
 
+/** A full-size buy at the current equity, or null when it cannot be placed. */
+function fullSizeBuy(state: BarsState): BuyInput | null {
+  let notional = (state.equity * BigInt(SIZE_BPS)) / BPS;
+  const room = state.weightRoom(SYMBOL);
+  if (notional > room) notional = room;
+  if (notional > state.cash) notional = state.cash;
+  if (notional < BigInt(state.hello.fees.min_notional_quote_units)) return null;
+  return { side: 'buy', symbol: SYMBOL, notional_quote_units: notional, max_slippage_bps: MAX_SLIPPAGE_BPS };
+}
+
 await runBars({
   onBatch(state, batch) {
     for (const bar of batch.bars) {
@@ -77,12 +96,13 @@ await runBars({
     if (state.warmingUp) return [];
 
     // Fold in the fills this batch reports: a filled buy opens the
-    // position and starts its hold clock; a filled sell closes it and
-    // starts the re-entry cooldown.
+    // position, starts its hold clock and disarms the dip entry; a
+    // filled sell closes it and starts the re-entry cooldown.
     for (const fill of batch.fills) {
       if (fill.symbol !== SYMBOL || fill.status !== 'filled') continue;
       if (fill.side === 'buy') {
         entrySeq = fill.fill_bar;
+        stopPrice = null;
       } else {
         exitSeq = fill.fill_bar;
         entrySeq = null;
@@ -96,10 +116,23 @@ await runBars({
       const stopLossLine = (held.cost * BigInt(10000 - STOP_LOSS_BPS)) / 10000n;
       const heldTooLong = entrySeq !== null && state.seq - entrySeq >= MAX_HOLD_BARS;
       if (value >= takeProfitLine || value <= stopLossLine || heldTooLong) {
+        // A stop-out arms the dip entry at this bar's close; the other
+        // exits leave stopPrice alone (it is null unless a stop set it).
+        if (value <= stopLossLine) stopPrice = closes[closes.length - 1]!;
         const sell: SellInput = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS };
         return [sell];
       }
       return [];
+    }
+
+    // Flat with a dip armed: the close 10% under the stop price buys
+    // back in at once, ahead of cooldown and signal alike.
+    if (stopPrice !== null) {
+      const dipLine = (stopPrice * (10000 - DIP_ENTRY_BPS)) / 10000;
+      if (closes[closes.length - 1]! <= dipLine) {
+        const buy = fullSizeBuy(state);
+        if (buy !== null) return [buy];
+      }
     }
 
     // Flat: respect the post-close cooldown, then re-enter on the same
@@ -108,12 +141,7 @@ await runBars({
     const mom = momentumBps();
     if (ema === null || mom === null || closes[closes.length - 1]! <= ema) return [];
     if (mom < MOM_ENTRY_BPS) return [];
-    let notional = (state.equity * BigInt(SIZE_BPS)) / BPS;
-    const room = state.weightRoom(SYMBOL);
-    if (notional > room) notional = room;
-    if (notional > state.cash) notional = state.cash;
-    if (notional < BigInt(state.hello.fees.min_notional_quote_units)) return [];
-    const buy: BuyInput = { side: 'buy', symbol: SYMBOL, notional_quote_units: notional, max_slippage_bps: MAX_SLIPPAGE_BPS };
-    return [buy];
+    const buy = fullSizeBuy(state);
+    return buy === null ? [] : [buy];
   },
 });
